@@ -60,6 +60,22 @@ SCHEMA_STATEMENTS: Sequence[str] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS unit_equations (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id  INTEGER NOT NULL REFERENCES records(id),
+        unit_a     TEXT NOT NULL,
+        qty_a      INTEGER NOT NULL CHECK (qty_a > 0),
+        unit_b     TEXT NOT NULL,
+        qty_b      INTEGER NOT NULL CHECK (qty_b > 0),
+        created_at TEXT NOT NULL,
+        CHECK (unit_a <> unit_b)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_unit_equations_record
+    ON unit_equations(record_id)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS previews (
         id            TEXT PRIMARY KEY,
         created_at    TEXT NOT NULL,

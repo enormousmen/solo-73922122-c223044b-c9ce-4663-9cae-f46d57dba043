@@ -8,9 +8,9 @@ from typing import Any, Literal, Optional
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt, StrictStr
 
-from . import db, service
+from . import convert_service, db, service
 from .grouping import build_grouping
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -27,6 +27,24 @@ class PreviewRequest(BaseModel):
 
 class ConfirmRequest(BaseModel):
     snapshot_digest: Optional[str] = None
+
+
+class EquationRequest(BaseModel):
+    record_id: StrictInt
+    unit_a: StrictStr
+    qty_a: StrictInt
+    unit_b: StrictStr
+    qty_b: StrictInt
+
+
+class EquationDeleteRequest(BaseModel):
+    equation_id: StrictInt
+
+
+class ConversionQueryRequest(BaseModel):
+    record_id: StrictInt
+    unit: StrictStr
+    quantity: StrictInt
 
 
 def create_app(
@@ -72,6 +90,12 @@ def create_app(
     async def api_problem_handler(request: Request, exc: service.ApiProblem):
         return JSONResponse(status_code=exc.status, content=exc.body())
 
+    @app.exception_handler(convert_service.ApiProblem)
+    async def convert_problem_handler(
+        request: Request, exc: convert_service.ApiProblem
+    ):
+        return JSONResponse(status_code=exc.status, content=exc.body())
+
     def get_conn():
         conn = db.connect(resolved_db)
         try:
@@ -82,6 +106,14 @@ def create_app(
     @app.get("/", include_in_schema=False)
     def index():
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/convert", include_in_schema=False)
+    def convert_page():
+        return FileResponse(STATIC_DIR / "convert.html")
+
+    @app.get("/static/app.css", include_in_schema=False)
+    def stylesheet():
+        return FileResponse(STATIC_DIR / "app.css", media_type="text/css")
 
     @app.get("/favicon.ico", include_in_schema=False)
     def favicon():
@@ -143,6 +175,27 @@ def create_app(
     @app.post("/api/previews/{preview_id}/cancel")
     def api_cancel(preview_id: str, conn=Depends(get_conn)):
         return service.cancel_preview(conn, preview_id)
+
+    @app.post("/api/equations")
+    def api_add_equation(body: EquationRequest, conn=Depends(get_conn)):
+        return convert_service.add_equation(
+            conn,
+            body.record_id,
+            body.unit_a,
+            body.qty_a,
+            body.unit_b,
+            body.qty_b,
+        )
+
+    @app.post("/api/equations/delete")
+    def api_delete_equation(body: EquationDeleteRequest, conn=Depends(get_conn)):
+        return convert_service.delete_equation(conn, body.equation_id)
+
+    @app.post("/api/conversion/query")
+    def api_conversion_query(body: ConversionQueryRequest, conn=Depends(get_conn)):
+        return convert_service.query_conversion(
+            conn, body.record_id, body.unit, body.quantity
+        )
 
     return app
 

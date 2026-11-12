@@ -10,7 +10,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
-from . import db
+from . import convert_service, db
+from .conversion import group_equation_conflicts
 from .grouping import (
     REL_DIFF,
     REL_SAME,
@@ -103,15 +104,17 @@ def make_snapshot(
     involved_ids: set[int],
     grouping: Grouping,
     decisions: Sequence[Mapping[str, Any]],
+    equations: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The revalidation contract.
 
     It deliberately contains only the records in the groups involved in the
-    pending operation and determinations touching those records.  A change to
-    an unrelated group therefore cannot affect confirmation.
+    pending operation, determinations touching those records, and the unit
+    equations contributed by those groups.  A change to an unrelated group
+    therefore cannot affect confirmation.
     """
     group_keys = sorted({grouping.group_of[rid] for rid in involved_ids})
-    return {
+    snapshot = {
         "involved_ids": sorted(involved_ids),
         "record_group": {
             str(rid): grouping.group_of[rid] for rid in sorted(involved_ids)
@@ -132,6 +135,23 @@ def make_snapshot(
             key=lambda item: item["id"],
         ),
     }
+    if equations is not None:
+        snapshot["associated_equations"] = sorted(
+            [
+                {
+                    "id": int(equation["id"]),
+                    "record_id": int(equation["record_id"]),
+                    "unit_a": equation["unit_a"],
+                    "qty_a": int(equation["qty_a"]),
+                    "unit_b": equation["unit_b"],
+                    "qty_b": int(equation["qty_b"]),
+                }
+                for equation in equations
+                if grouping.group_of.get(int(equation["record_id"])) in set(group_keys)
+            ],
+            key=lambda item: item["id"],
+        )
+    return snapshot
 
 
 def snapshot_digest(snapshot: Mapping[str, Any]) -> str:
@@ -256,9 +276,13 @@ def build_state(conn: sqlite3.Connection, instance: str) -> dict[str, Any]:
     with db.read_tx(conn):
         records = load_records(conn)
         decisions = load_decisions(conn)
+        equations = convert_service.load_equations(conn)
         by_id = {int(record["id"]): record for record in records}
         grouping = build_grouping([int(r["id"]) for r in records], decisions)
         broken = invalid_diff_decisions(decisions, grouping)
+
+        equations_grouped = convert_service.equations_by_group(grouping, equations)
+        equation_conflicts = group_equation_conflicts(equations_grouped)
 
         groups = []
         for key, ids in grouping.by_key.items():
@@ -285,6 +309,10 @@ def build_state(conn: sqlite3.Connection, instance: str) -> dict[str, Any]:
                     view["other_record"] = record_brief(by_id[other_id])
                     view["other_group"] = grouping.group_of[other_id]
                     diff_links.append(view)
+            group_equation_views = [
+                convert_service.equation_view(equation, by_id, key)
+                for equation in equations_grouped.get(key, [])
+            ]
             groups.append(
                 {
                     "key": key,
@@ -293,6 +321,11 @@ def build_state(conn: sqlite3.Connection, instance: str) -> dict[str, Any]:
                     "suggested_subject": subject,
                     "same_basis": same_basis,
                     "diff_links": diff_links,
+                    "equations": group_equation_views,
+                    "equation_count": len(group_equation_views),
+                    "units": convert_service.group_units(
+                        equations_grouped.get(key, [])
+                    ),
                 }
             )
 
@@ -348,12 +381,23 @@ def build_state(conn: sqlite3.Connection, instance: str) -> dict[str, Any]:
             )
         )
 
+        equation_payloads = [
+            convert_service.equation_view(
+                equation, by_id, grouping.group_of.get(int(equation["record_id"]))
+            )
+            for equation in equations
+        ]
+
         return {
             "instance": instance,
             "generated_at": utc_now(),
+            "state_version": convert_service.compute_state_version(
+                grouping, decisions, equations
+            ),
             "records": [record_brief(record) for record in records],
             "groups": groups,
             "decisions": decision_payloads,
+            "equations": equation_payloads,
             "same_name_pairs": pairs,
             "stats": {
                 "records": len(records),
@@ -361,9 +405,18 @@ def build_state(conn: sqlite3.Connection, instance: str) -> dict[str, Any]:
                 "merged_groups": sum(1 for group in groups if group["size"] > 1),
                 "same_decisions": sum(1 for d in decisions if d["relation"] == REL_SAME),
                 "diff_decisions": sum(1 for d in decisions if d["relation"] == REL_DIFF),
+                "equations": len(equations),
             },
             "invariant_violations": [
                 decision_view(item, by_id) for item in broken
+            ],
+            "equation_invariant_violations": [
+                convert_service.equation_conflict_payload(
+                    conflict,
+                    by_id,
+                    conflict.get("group_key"),
+                )
+                for conflict in equation_conflicts
             ],
         }
 
@@ -393,6 +446,7 @@ def _create_preview(conn: sqlite3.Connection, action: dict[str, Any]) -> dict[st
         records = load_records(conn)
         by_id = {int(record["id"]): record for record in records}
         decisions = load_decisions(conn)
+        equations = convert_service.load_equations(conn)
         all_ids = list(by_id)
         grouping = build_grouping(all_ids, decisions)
         broken = invalid_diff_decisions(decisions, grouping)
@@ -402,6 +456,21 @@ def _create_preview(conn: sqlite3.Connection, action: dict[str, Any]) -> dict[st
                 "inconsistent_state",
                 "数据库中的判定已自相矛盾，请联系管理员检查。",
                 invalid_decisions=[decision_view(item, by_id) for item in broken],
+            )
+        equation_conflicts = group_equation_conflicts(
+            convert_service.equations_by_group(grouping, equations)
+        )
+        if equation_conflicts:
+            raise ApiProblem(
+                500,
+                "inconsistent_state",
+                "数据库中的换算等式已出现组内闭环比例矛盾，请联系管理员检查。",
+                equation_conflicts=[
+                    convert_service.equation_conflict_payload(
+                        conflict, by_id, conflict.get("group_key")
+                    )
+                    for conflict in equation_conflicts
+                ],
             )
 
         tentative: list[dict[str, Any]] = list(decisions)
@@ -469,6 +538,24 @@ def _create_preview(conn: sqlite3.Connection, action: dict[str, Any]) -> dict[st
                             by_id,
                         )
                         return _conflict_response(action, conflict, by_id)
+                    merge_conflict = convert_service.prospective_merge_conflict(
+                        grouping,
+                        equations,
+                        set(grouping.by_key[key_left])
+                        | set(grouping.by_key[key_right]),
+                        by_id,
+                    )
+                    if merge_conflict is not None:
+                        conflict = {
+                            "code": "merge_unit_ratio_conflict",
+                            "message": (
+                                "无法判定为同一企业：拟合并的两个分组各有换算等式，"
+                                "合并后同一单位会出现两个互相矛盾的比例。"
+                                "请先处理下列矛盾等式（删除或撤回相关判定以保持拆分）。"
+                            ),
+                            "equation_conflict": merge_conflict,
+                        }
+                        return _conflict_response(action, conflict, by_id)
             else:
                 if key_left == key_right:
                     path = find_same_path(decisions, left, right)
@@ -521,7 +608,7 @@ def _create_preview(conn: sqlite3.Connection, action: dict[str, Any]) -> dict[st
             )
 
         involved_set = set(involved)
-        snapshot = make_snapshot(involved_set, grouping, decisions)
+        snapshot = make_snapshot(involved_set, grouping, decisions, equations)
         digest = snapshot_digest(snapshot)
         before_labels = _group_labels(grouping, involved_set, "前组")
         after_labels = _group_labels(after, involved_set, "后组")
@@ -748,9 +835,44 @@ def confirm_preview(
         records = load_records(conn)
         by_id = {int(record["id"]): record for record in records}
         decisions = load_decisions(conn)
+        equations = convert_service.load_equations(conn)
         grouping = build_grouping(list(by_id), decisions)
 
-        current_snapshot = make_snapshot(involved, grouping, decisions)
+        # Check the prospective group against the *latest* equations first: a
+        # concurrent equation add on another process may have made the proposed
+        # merge contradictory after the preview, and the user must see which
+        # equations clash rather than a generic "preview expired".
+        if action["kind"] == "add" and action["relation"] == REL_SAME:
+            left, right = int(action["record_a"]), int(action["record_b"])
+            if grouping.group_of[left] != grouping.group_of[right]:
+                merge_conflict = convert_service.prospective_merge_conflict(
+                    grouping,
+                    equations,
+                    set(grouping.by_key[grouping.group_of[left]])
+                    | set(grouping.by_key[grouping.group_of[right]]),
+                    by_id,
+                )
+                if merge_conflict is not None:
+                    conn.execute(
+                        "UPDATE previews SET status = ? WHERE id = ?",
+                        (PREVIEW_STALE, preview_id),
+                    )
+                    return 409, {
+                        "ok": False,
+                        "error": {
+                            "code": "merge_unit_ratio_conflict",
+                            "message": (
+                                "确认时按最新状态校验发现：拟合并分组的换算等式存在"
+                                "闭环比例矛盾，已拒绝合并，请重新预览。"
+                            ),
+                            "equation_conflict": merge_conflict,
+                        },
+                        "preview_id": preview_id,
+                    }
+
+        current_snapshot = make_snapshot(
+            involved, grouping, decisions, equations
+        )
         if canonical_json(current_snapshot) != canonical_json(stored_snapshot):
             conn.execute(
                 "UPDATE previews SET status = ? WHERE id = ?",
@@ -761,8 +883,8 @@ def confirm_preview(
                 "error": {
                     "code": "preview_stale",
                     "message": (
-                        "预览已过期：所涉原组成员或这些成员关联的判定在预览后发生变化，"
-                        "请重新预览后再确认。"
+                        "预览已过期：所涉原组成员、这些成员关联的判定或换算等式"
+                        "在预览后发生变化，请重新预览后再确认。"
                     ),
                 },
                 "preview_id": preview_id,
@@ -853,6 +975,21 @@ def confirm_preview(
                 500,
                 "inconsistent_operation",
                 "保存时检测到分组自相矛盾，已回滚。",
+            )
+        final_equation_conflicts = group_equation_conflicts(
+            convert_service.equations_by_group(final_grouping, equations)
+        )
+        if final_equation_conflicts:
+            raise ApiProblem(
+                500,
+                "inconsistent_operation",
+                "保存时检测到组内换算闭环比例矛盾，已回滚。",
+                equation_conflicts=[
+                    convert_service.equation_conflict_payload(
+                        conflict, by_id, conflict.get("group_key")
+                    )
+                    for conflict in final_equation_conflicts
+                ],
             )
 
         stamp = utc_now()

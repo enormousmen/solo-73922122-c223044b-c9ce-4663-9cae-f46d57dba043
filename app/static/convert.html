@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>包装单位换算台</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="mark">换</div>
+    <div>
+      <h1>包装单位换算台</h1>
+      <p>按供应商原始记录维护换算等式 · 精确分数换算为“件” · 组内来源隔离</p>
+    </div>
+  </div>
+  <div class="topnav">
+    <a href="/">← 返回主体审校台</a>
+  </div>
+  <div class="serve">
+    <span class="dot"></span>
+    <span>服务进程</span><b id="instance">—</b>
+    <button class="ghost-btn" id="refreshBtn" title="重新读取共享数据库">刷新</button>
+  </div>
+</header>
+
+<main>
+  <div id="loading" class="loading">正在载入换算数据…</div>
+  <div id="app" hidden>
+    <section class="stats stats-six" id="stats"></section>
+
+    <div id="invariantAlert" hidden></div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>新增换算等式</h2>
+          <div class="sub">等式挂在供应商原始记录上，自动进入该记录当前所在分组；每条记录最多 20 条，数量必须为正整数。</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="field" style="max-width:520px">
+          <label for="eqRecord">供应商原始记录（等式来源）</label>
+          <select id="eqRecord"></select>
+        </div>
+        <div style="height:12px"></div>
+        <div class="eq-form">
+          <div class="field">
+            <label for="qtyA">数量 A（正整数）</label>
+            <input id="qtyA" type="number" min="1" step="1" inputmode="numeric" value="2">
+          </div>
+          <div class="field">
+            <label for="unitA">单位 A（非空）</label>
+            <input id="unitA" type="text" maxlength="20" value="箱" placeholder="如：箱">
+          </div>
+          <div class="eq-eq">=</div>
+          <div class="field">
+            <label for="qtyB">数量 B（正整数）</label>
+            <input id="qtyB" type="number" min="1" step="1" inputmode="numeric" value="24">
+          </div>
+          <div class="field">
+            <label for="unitB">单位 B（非空）</label>
+            <input id="unitB" type="text" maxlength="20" value="件" placeholder="如：件">
+          </div>
+        </div>
+        <div class="work-actions">
+          <button class="btn btn-primary" id="addEqBtn">添加等式</button>
+          <span class="pair-hint" id="eqHint" style="margin-top:0">填写如 2箱=24件 的换算等式。</span>
+        </div>
+        <div class="samples">
+          <span class="muted small" style="align-self:center">样例：</span>
+          <button type="button" data-sample="2|箱|24|件">2箱=24件</button>
+          <button type="button" data-sample="3|盒|1|箱">3盒=1箱（多跳）</button>
+          <button type="button" data-sample="1|托|48|件">1托=48件</button>
+        </div>
+        <div id="addResult"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>采购量换算为“件”</h2>
+          <div class="sub">只使用所选记录当前分组内来源的等式，支持反向与多跳；结果为精确最简分数，并返回所用等式来源。</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="query-form">
+          <div class="field">
+            <label for="qRecord">供应商原始记录（决定使用哪个组的等式）</label>
+            <select id="qRecord"></select>
+          </div>
+          <div class="field">
+            <label for="qUnit">采购单位</label>
+            <input id="qUnit" type="text" maxlength="20" list="unitList" placeholder="如：箱" value="箱">
+            <datalist id="unitList"></datalist>
+          </div>
+          <div class="field">
+            <label for="qQty">正整数采购量</label>
+            <input id="qQty" type="number" min="1" step="1" inputmode="numeric" value="1">
+          </div>
+          <div class="field">
+            <label>&nbsp;</label>
+            <button class="btn btn-primary" id="queryBtn" style="width:100%">换算为件</button>
+          </div>
+        </div>
+        <div id="queryResult"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>换算等式清单</h2>
+          <div class="sub">按当前分组聚合展示；删除即时生效，分组拆分后各组只保留各自来源的等式。</div>
+        </div>
+        <span class="pill neutral" id="eqCount"></span>
+      </div>
+      <div class="table-scroll">
+        <table class="data eq-table">
+          <thead>
+            <tr>
+              <th>编号</th>
+              <th>等式</th>
+              <th>来源原始记录</th>
+              <th>所在分组</th>
+              <th>创建时间</th>
+              <th style="width:90px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="eqBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  "use strict";
+
+  const $ = (sel, root = document) => root.querySelector(sel);
+
+  const esc = (value) => String(value ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+  let toastTimer = null;
+  function toast(message, kind = "ok") {
+    const box = $("#toast");
+    box.textContent = message;
+    box.className = "toast show " + kind;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { box.className = "toast " + kind; }, 4200);
+  }
+
+  class ApiError extends Error {
+    constructor(status, payload) {
+      super(payload?.error?.message || `请求失败（${status}）`);
+      this.status = status;
+      this.payload = payload || {};
+    }
+  }
+
+  async function api(path, options = {}) {
+    const response = await fetch(path, {
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...options,
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch (_) { /* empty */ }
+    if (!response.ok) throw new ApiError(response.status, payload);
+    return payload;
+  }
+
+  const stateBox = { state: null, lastQuery: null };
+
+  function sourceBadge(source) {
+    let hash = 0;
+    for (const ch of String(source || "")) hash = (hash * 31 + ch.charCodeAt(0)) | 0;
+    return `<span class="source-badge src-${Math.abs(hash) % 4}">${esc(source)}</span>`;
+  }
+
+  function recordLabel(record) {
+    return `${esc(record.name)} ｜ ${esc(record.source)} ${esc(record.source_code)} (#${record.id})`;
+  }
+
+  function groupOf(recordId) {
+    return stateBox.state.groups.find((g) =>
+      g.members.some((m) => m.id === recordId)) || null;
+  }
+
+  function fmtTime(value) {
+    return value ? esc(value.replace("T", " ").replace("+00:00", " UTC")) : "—";
+  }
+
+  // --------------------------------------------------------------- rendering
+
+  function renderStats() {
+    const stats = stateBox.state.stats;
+    $("#stats").innerHTML = [
+      ["供应商记录", stats.records, "原始记录只读"],
+      ["当前分组", stats.groups, `${stats.merged_groups} 个已归并`],
+      ["换算等式", stats.equations ?? 0, "每记录最多 20 条"],
+      ["含等式的分组", stateBox.state.groups.filter((g) => g.equation_count > 0).length, "组内共享"],
+      ["同一企业判定", stats.same_decisions, "决定分组来源"],
+      ["不同企业判定", stats.diff_decisions, "禁止同组约束"],
+    ].map(([label, value, note]) => `
+      <div class="stat">
+        <div class="label">${label}</div>
+        <div class="value">${value}<small>${esc(note)}</small></div>
+      </div>`).join("");
+  }
+
+  function renderInvariantAlert() {
+    const violations = stateBox.state.equation_invariant_violations || [];
+    const box = $("#invariantAlert");
+    if (!violations.length) { box.hidden = true; box.innerHTML = ""; return; }
+    box.hidden = false;
+    box.innerHTML = violations.map((ec) => `
+      <div class="alert danger" style="margin-bottom:12px">
+        <h3>检测到组内换算闭环比例矛盾</h3>
+        <p>${esc(ec.message)}</p>
+        <div class="evidence-list">
+          <div class="evidence-row"><span class="pill diff">等式</span>
+            <span class="eq-badge">${esc(ec.candidate.text)}</span>
+            <span class="muted small">#${ec.candidate.id}</span></div>
+          ${(ec.evidence || []).map((item) => `
+            <div class="evidence-row"><span class="pill warn">矛盾等式</span>
+              <span class="eq-badge">${esc(item.text)}</span>
+              <span class="muted small">#${item.id}</span></div>`).join("")}
+        </div>
+      </div>`).join("");
+  }
+
+  function renderRecordSelects() {
+    const records = stateBox.state.records;
+    const options = records.map((r) =>
+      `<option value="${r.id}">${recordLabel(r)}</option>`).join("");
+    const prevEq = $("#eqRecord").value;
+    const prevQ = $("#qRecord").value;
+    $("#eqRecord").innerHTML = options;
+    $("#qRecord").innerHTML = options;
+    if (prevEq && records.some((r) => r.id === Number(prevEq))) $("#eqRecord").value = prevEq;
+    if (prevQ && records.some((r) => r.id === Number(prevQ))) $("#qRecord").value = prevQ;
+    updateUnitList();
+    updateEqHint();
+  }
+
+  function updateUnitList() {
+    const group = groupOf(Number($("#qRecord").value));
+    const units = group ? group.units : [];
+    const all = Array.from(new Set(["件", ...units]));
+    $("#unitList").innerHTML = all.map((u) => `<option value="${esc(u)}">`).join("");
+  }
+
+  function updateEqHint() {
+    const recordId = Number($("#eqRecord").value);
+    const group = groupOf(recordId);
+    const own = stateBox.state.equations.filter((e) => e.record_id === recordId).length;
+    $("#eqHint").innerHTML =
+      `该记录已有 <strong>${own}/20</strong> 条等式；当前分组共 ` +
+      `<strong>${group ? group.equation_count : 0}</strong> 条等式，新增时会校验组内闭环比例。`;
+  }
+
+  function renderEquationTable() {
+    const equations = [...stateBox.state.equations].reverse();
+    $("#eqCount").textContent = equations.length + " 条等式";
+    const body = $("#eqBody");
+    if (!equations.length) {
+      body.innerHTML = `<tr><td colspan="6"><div class="empty">还没有换算等式。请在上方添加，例如 2箱=24件。</div></td></tr>`;
+      return;
+    }
+    body.innerHTML = equations.map((e) => {
+      const group = groupOf(e.record_id);
+      return `<tr>
+        <td><span class="mono small">#${e.id}</span></td>
+        <td><span class="eq-badge">${esc(e.text)}</span></td>
+        <td>${e.record ? `${sourceBadge(e.record.source)}
+          <span class="mono small">${esc(e.record.source_code)}</span> ${esc(e.record.name)}` : "—"}</td>
+        <td><span class="group-key" title="${esc(group?.key || "")}">${esc((group?.key || "").slice(0, 11))}…</span>
+          <span class="muted small">（${group ? group.size : 0} 条记录）</span></td>
+        <td class="small muted">${fmtTime(e.created_at)}</td>
+        <td><button class="tiny-btn judge-diff" data-delete="${e.id}">删除</button></td>
+      </tr>`;
+    }).join("");
+  }
+
+  function renderAll() {
+    if (!stateBox.state) return;
+    $("#loading").hidden = true;
+    $("#app").hidden = false;
+    $("#instance").textContent = stateBox.state.instance || "—";
+    renderStats();
+    renderInvariantAlert();
+    renderRecordSelects();
+    renderEquationTable();
+  }
+
+  // ------------------------------------------------------------- add / delete
+
+  function conflictDetail(conflict) {
+    if (!conflict) return "";
+    const evidence = conflict.evidence || [];
+    return `<div class="alert danger" style="margin-top:14px">
+      <h3>组内闭环比例矛盾，已拒绝新增</h3>
+      <p>${esc(conflict.message)}</p>
+      <div class="evidence-list">
+        <div class="evidence-row"><span class="pill diff">拟新增</span>
+          <span class="eq-badge">${esc(conflict.candidate.text)}</span></div>
+        ${evidence.map((item) => `
+          <div class="evidence-row"><span class="pill warn">矛盾等式</span>
+            <span class="eq-badge">${esc(item.text)}</span>
+            <span class="muted small">来源 ${esc(item.record?.source_code || ("#" + item.record_id))} · #${item.id}</span>
+          </div>`).join("")}
+      </div>
+      <p class="small muted" style="margin-top:8px">
+        现有比例 1${esc(conflict.units[0])} = ${esc(conflict.existing_rate)}${esc(conflict.units[1])}，
+        新等式给出 1${esc(conflict.units[0])} = ${esc(conflict.candidate_rate)}${esc(conflict.units[1])}。
+      </p>
+    </div>`;
+  }
+
+  async function addEquation() {
+    const body = {
+      record_id: Number($("#eqRecord").value),
+      qty_a: Number($("#qtyA").value),
+      unit_a: $("#unitA").value,
+      qty_b: Number($("#qtyB").value),
+      unit_b: $("#unitB").value,
+    };
+    const btn = $("#addEqBtn");
+    btn.disabled = true;
+    try {
+      const payload = await api("/api/equations", { method: "POST", body: JSON.stringify(body) });
+      $("#addResult").innerHTML = `<div class="summary-box" style="margin-top:14px">
+        已添加等式 <b>${esc(payload.equation.text)}</b>（#${payload.equation.id}），状态版本
+        <span class="mono small">${esc(payload.state_version)}</span>。</div>`;
+      await loadState({ silent: true });
+      toast(`等式 ${payload.equation.text} 已保存（进程 ${stateBox.state.instance}）`);
+    } catch (error) {
+      const detail = error.payload?.error?.conflict
+        ? conflictDetail(error.payload.error.conflict) : "";
+      $("#addResult").innerHTML = `<div class="alert danger" style="margin-top:14px">
+        <h3>添加失败，状态未改变</h3><p>${esc(error.message)}</p>
+        <div class="code">${esc(error.payload?.error?.code || "error")}</div></div>${detail}`;
+      toast(error.message || "添加失败", "error");
+    } finally {
+      btn.disabled = false;
+      updateEqHint();
+    }
+  }
+
+  async function deleteEquation(id) {
+    if (!window.confirm(`确认删除换算等式 #${id} 吗？删除立即生效且不可撤销。`)) return;
+    try {
+      await api("/api/equations/delete", {
+        method: "POST", body: JSON.stringify({ equation_id: id }),
+      });
+      await loadState({ silent: true });
+      toast(`等式 #${id} 已删除（进程 ${stateBox.state.instance}）`);
+    } catch (error) {
+      toast(error.message || "删除失败", "error");
+    } finally {
+      updateEqHint();
+    }
+  }
+
+  // ------------------------------------------------------------------- query
+
+  function renderQueryResult(query) {
+    stateBox.lastQuery = query;
+    if (!query.reachable) {
+      $("#queryResult").innerHTML = `<div class="result-card missing">
+        <h3 style="margin:0 0 4px">无换算通路</h3>
+        <p style="margin:0">${esc(query.message)}</p>
+        <div class="result-meta" style="margin-top:10px">
+          <span class="pill warn">缺失</span>
+          <span class="unit-chip">${esc(query.quantity)}${esc(query.unit)}</span>
+          <span class="unit-chip">目标：${esc(query.target_unit)}</span>
+          ${(query.reachable_units || []).map((u) => `<span class="unit-chip">可达：${esc(u)}</span>`).join("")}
+        </div>
+        <p class="small muted" style="margin:6px 0 0">请在该分组任一供应商原始记录上补充缺失等式后再查询。</p>
+      </div>`;
+      return;
+    }
+    $("#queryResult").innerHTML = `<div class="result-card">
+      <h3 style="margin:0">精确换算结果（最简分数）</h3>
+      <div class="big"><span class="frac">${esc(query.result_text)}</span>${esc(query.target_unit)}</div>
+      <div class="result-meta">
+        <span class="pill same">${query.is_integer ? "整数结果" : "分数结果"}</span>
+        <span class="unit-chip">${esc(query.quantity)}${esc(query.unit)}</span>
+        <span class="unit-chip">1${esc(query.unit)} = ${esc(query.rate_per_unit)}${esc(query.target_unit)}</span>
+        <span class="unit-chip">${query.hops} 跳</span>
+        <span class="unit-chip">状态版本 <span class="mono">${esc(query.state_version)}</span></span>
+      </div>
+      <div class="basis-title" style="color:#0b5d56">所用等式及来源（仅来自当前组）</div>
+      ${query.hops === 0 ? `<p class="small muted" style="margin:6px 0 0">采购单位已是“件”，无需换算（0 跳）。</p>` : `
+      <div class="chain">
+        ${query.used_equations.map((e, index) => `
+          <div class="hop">
+            <span class="idx">${index + 1}</span>
+            <span class="eq-badge">${esc(e.text)}</span>
+            <span class="origin">来源：${esc(e.record ? `${e.record.source} ${e.record.source_code} ${e.record.name}` : ("#" + e.record_id))} · 等式 #${e.id}</span>
+          </div>`).join("")}
+      </div>`}
+      <p class="small" style="margin:10px 0 0">${esc(query.expression)}</p>
+    </div>`;
+  }
+
+  async function runQuery() {
+    const body = {
+      record_id: Number($("#qRecord").value),
+      unit: $("#qUnit").value,
+      quantity: Number($("#qQty").value),
+    };
+    try {
+      const payload = await api("/api/conversion/query", {
+        method: "POST", body: JSON.stringify(body),
+      });
+      renderQueryResult(payload.query);
+    } catch (error) {
+      $("#queryResult").innerHTML = `<div class="alert danger" style="margin-top:14px">
+        <h3>查询失败</h3><p>${esc(error.message)}</p>
+        <div class="code">${esc(error.payload?.error?.code || "error")}</div></div>`;
+      toast(error.message || "查询失败", "error");
+    }
+  }
+
+  async function loadState({ silent = false } = {}) {
+    try {
+      const payload = await api("/api/state");
+      stateBox.state = payload.state;
+      renderAll();
+      if (!silent) toast(`已刷新 · 由进程 ${payload.state.instance} 响应`);
+    } catch (error) {
+      $("#loading").textContent = "载入失败：" + (error.message || "未知错误");
+    }
+  }
+
+  // ------------------------------------------------------------------ events
+
+  $("#refreshBtn").addEventListener("click", () => loadState());
+  $("#addEqBtn").addEventListener("click", addEquation);
+  $("#queryBtn").addEventListener("click", runQuery);
+  $("#eqRecord").addEventListener("change", updateEqHint);
+  $("#qRecord").addEventListener("change", updateUnitList);
+  document.addEventListener("click", (event) => {
+    const del = event.target.closest("[data-delete]");
+    if (del) { deleteEquation(Number(del.getAttribute("data-delete"))); return; }
+    const sample = event.target.closest("[data-sample]");
+    if (sample) {
+      const [qtyA, unitA, qtyB, unitB] = sample.getAttribute("data-sample").split("|");
+      $("#qtyA").value = qtyA; $("#unitA").value = unitA;
+      $("#qtyB").value = qtyB; $("#unitB").value = unitB;
+    }
+  });
+  [$("#qtyA"), $("#qtyB"), $("#unitA"), $("#unitB")].forEach((el) =>
+    el.addEventListener("keydown", (event) => { if (event.key === "Enter") addEquation(); }));
+  [$("#qUnit"), $("#qQty")].forEach((el) =>
+    el.addEventListener("keydown", (event) => { if (event.key === "Enter") runQuery(); }));
+
+  loadState({ silent: true });
+})();
+</script>
+</body>
+</html>
